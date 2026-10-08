@@ -6,22 +6,6 @@
 
 
 
-\[!\[Python](https://img.shields.io/badge/Python-3.x-blue?logo=python)](https://www.python.org/)
-
-\[!\[Streamlit](https://img.shields.io/badge/Streamlit-App-red?logo=streamlit)](https://streamlit.io/)
-
-\[!\[Scikit-learn](https://img.shields.io/badge/Scikit--learn-ML-orange?logo=scikit-learn)](https://scikit-learn.org/)
-
-\[!\[Gmail API](https://img.shields.io/badge/Gmail-API-red?logo=gmail)](https://developers.google.com/gmail/api)
-
-\[!\[Ollama](https://img.shields.io/badge/Ollama-AI-black)](https://ollama.com/)
-
-
-
-\---
-
-
-
 \## 🌐 Application Links
 
 
