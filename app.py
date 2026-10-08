@@ -1,24 +1,22 @@
-import streamlit as st
 import os
 import re
 import html
 import base64
 import pickle
-import pandas as pd
-import ollama
-
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
+import pandas as pd
+import streamlit as st
+
 from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
-
-# =========================================================
+# ============================================================
 # PAGE CONFIG
-# =========================================================
+# ============================================================
 
 st.set_page_config(
     page_title="SmartMail AI",
@@ -26,10 +24,9 @@ st.set_page_config(
     layout="wide"
 )
 
-
-# =========================================================
-# GMAIL SCOPES
-# =========================================================
+# ============================================================
+# CONSTANTS
+# ============================================================
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -37,83 +34,120 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify"
 ]
 
-
-# =========================================================
-# SESSION STATE
-# =========================================================
-
-if "page" not in st.session_state:
-    st.session_state.page = "📊 Dashboard"
-
-if "selected_email" not in st.session_state:
-    st.session_state.selected_email = None
-
-if "spam_results" not in st.session_state:
-    st.session_state.spam_results = {}
-
-if "manual_spam_results" not in st.session_state:
-    st.session_state.manual_spam_results = {}
-
-
-# =========================================================
-# LOAD SPAM MODEL
-# =========================================================
-
+TOKEN_FILE = "token.json"
+CREDENTIALS_FILE = "credentials.json"
 MODEL_FILE = "spam_model.pkl"
 
-vectorizer = None
-spam_model = None
+# ============================================================
+# CUSTOM CSS
+# ============================================================
 
-try:
-    with open(MODEL_FILE, "rb") as f:
-        vectorizer, spam_model = pickle.load(f)
-except Exception as e:
-    vectorizer = None
-    spam_model = None
+st.markdown("""
+<style>
 
+.main {
+    background-color: #f5f7fb;
+}
 
-# =========================================================
+.block-container {
+    padding-top: 1.5rem;
+}
+
+.smartmail-title {
+    font-size: 34px;
+    font-weight: 700;
+    margin-bottom: 0;
+}
+
+.smartmail-subtitle {
+    color: #667085;
+    font-size: 16px;
+}
+
+.email-card {
+    padding: 18px;
+    border-radius: 14px;
+    background: white;
+    border: 1px solid #e5e7eb;
+    margin-bottom: 10px;
+}
+
+.metric-card {
+    background: white;
+    padding: 20px;
+    border-radius: 15px;
+    border: 1px solid #e5e7eb;
+    text-align: center;
+}
+
+.small-text {
+    color: #667085;
+    font-size: 13px;
+}
+
+</style>
+""", unsafe_allow_html=True)
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+defaults = {
+    "page": "Dashboard",
+    "selected_email": None,
+    "gmail": None,
+    "spam_results": {},
+    "email_cache": {},
+}
+
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+# ============================================================
 # GMAIL CONNECTION
-# =========================================================
+# ============================================================
 
-@st.cache_resource
 def get_gmail_service():
 
-    creds = None
+    try:
 
-    if os.path.exists("token.json"):
-        try:
+        creds = None
+
+        if os.path.exists(TOKEN_FILE):
+
             creds = Credentials.from_authorized_user_file(
-                "token.json",
+                TOKEN_FILE,
                 SCOPES
             )
-        except Exception:
-            creds = None
 
-    # Refresh expired token
-    if creds and creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
+        # Refresh token
+        if creds and creds.expired and creds.refresh_token:
 
-            with open("token.json", "w") as token:
-                token.write(creds.to_json())
+            try:
 
-        except Exception:
-            creds = None
+                creds.refresh(Request())
 
-    # Login if credentials are missing
-    if not creds or not creds.valid:
+                with open(TOKEN_FILE, "w") as token:
+                    token.write(creds.to_json())
 
-        if not os.path.exists("credentials.json"):
-            st.error(
-                "credentials.json not found. "
-                "Place your Google OAuth credentials file in the project folder."
-            )
-            return None
+            except Exception:
 
-        try:
+                creds = None
+
+        # New authentication
+        if not creds or not creds.valid:
+
+            if not os.path.exists(CREDENTIALS_FILE):
+
+                st.error(
+                    "credentials.json was not found in the project folder."
+                )
+
+                return None
+
             flow = InstalledAppFlow.from_client_secrets_file(
-                "credentials.json",
+                CREDENTIALS_FILE,
                 SCOPES
             )
 
@@ -123,47 +157,121 @@ def get_gmail_service():
                 prompt="consent"
             )
 
-            with open("token.json", "w") as token:
+            with open(TOKEN_FILE, "w") as token:
                 token.write(creds.to_json())
 
-        except Exception as e:
-            st.error(f"Gmail authentication failed: {e}")
-            return None
+        # IMPORTANT:
+        # cache_discovery=False avoids unnecessary discovery-cache
+        # problems and keeps the Gmail API connection clean.
 
-    try:
-        service = build(
+        gmail = build(
             "gmail",
             "v1",
-            credentials=creds
+            credentials=creds,
+            cache_discovery=False
         )
 
-        return service
+        # Verify connection
+        gmail.users().getProfile(
+            userId="me"
+        ).execute()
+
+        return gmail
 
     except Exception as e:
-        st.error(f"Could not connect to Gmail: {e}")
+
+        st.error(
+            f"Could not connect to Gmail: {e}"
+        )
+
         return None
 
 
-# =========================================================
-# GMAIL EMAIL HELPERS
-# =========================================================
+# ============================================================
+# GET MESSAGES
+# ============================================================
 
-def get_header(headers, name):
+def get_messages(gmail, query="", max_results=20):
+
+    try:
+
+        response = gmail.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=max_results
+        ).execute()
+
+        return response.get("messages", [])
+
+    except Exception as e:
+
+        st.error(
+            f"Could not retrieve emails: {e}"
+        )
+
+        return []
+
+
+# ============================================================
+# GET EMAIL
+# ============================================================
+
+def get_message(gmail, message_id):
+
+    if message_id in st.session_state.email_cache:
+
+        return st.session_state.email_cache[message_id]
+
+    try:
+
+        message = gmail.users().messages().get(
+            userId="me",
+            id=message_id,
+            format="full"
+        ).execute()
+
+        st.session_state.email_cache[message_id] = message
+
+        return message
+
+    except Exception as e:
+
+        st.error(
+            f"Could not open email: {e}"
+        )
+
+        return None
+
+
+# ============================================================
+# HEADER EXTRACTION
+# ============================================================
+
+def get_header(message, name):
+
+    headers = (
+        message
+        .get("payload", {})
+        .get("headers", [])
+    )
 
     for header in headers:
 
         if header.get("name", "").lower() == name.lower():
+
             return header.get("value", "")
 
     return ""
 
 
-def decode_base64(data):
+# ============================================================
+# EMAIL BODY
+# ============================================================
 
-    if not data:
-        return ""
+def decode_body(data):
 
     try:
+
         return base64.urlsafe_b64decode(
             data.encode("UTF-8")
         ).decode(
@@ -172,32 +280,32 @@ def decode_base64(data):
         )
 
     except Exception:
+
         return ""
 
 
 def get_email_body(payload):
 
-    """
-    Extract plain text email body recursively.
-    """
-
-    body = ""
-
     if not payload:
-        return body
+        return ""
 
     mime_type = payload.get("mimeType", "")
 
-    body_data = payload.get("body", {}).get("data")
+    body_data = (
+        payload
+        .get("body", {})
+        .get("data")
+    )
 
     if body_data:
 
-        decoded = decode_base64(body_data)
+        decoded = decode_body(body_data)
 
         if mime_type == "text/plain":
             return decoded
 
         if mime_type == "text/html":
+
             clean = re.sub(
                 r"<[^>]+>",
                 " ",
@@ -211,31 +319,31 @@ def get_email_body(payload):
         result = get_email_body(part)
 
         if result:
-            body += "\n" + result
+            return result
 
-    return body.strip()
+    return ""
 
 
-def get_email_html(payload):
-
-    """
-    Extract original HTML email content.
-    """
+def get_html_body(payload):
 
     if not payload:
         return ""
 
     mime_type = payload.get("mimeType", "")
 
-    body_data = payload.get("body", {}).get("data")
+    body_data = (
+        payload
+        .get("body", {})
+        .get("data")
+    )
 
-    if mime_type == "text/html" and body_data:
+    if body_data and mime_type == "text/html":
 
-        return decode_base64(body_data)
+        return decode_body(body_data)
 
     for part in payload.get("parts", []):
 
-        result = get_email_html(part)
+        result = get_html_body(part)
 
         if result:
             return result
@@ -243,295 +351,100 @@ def get_email_html(payload):
     return ""
 
 
-# =========================================================
-# CLEAN EMAIL HTML
-# =========================================================
+# ============================================================
+# SPAM MODEL
+# ============================================================
 
-def prepare_email_html(email_html):
+@st.cache_resource
+def load_spam_model():
 
-    if not email_html:
-        return ""
+    if not os.path.exists(MODEL_FILE):
 
-    # Remove dangerous tags
-    email_html = re.sub(
-        r"<script.*?>.*?</script>",
-        "",
-        email_html,
-        flags=re.IGNORECASE | re.DOTALL
-    )
-
-    email_html = re.sub(
-        r"<iframe.*?>.*?</iframe>",
-        "",
-        email_html,
-        flags=re.IGNORECASE | re.DOTALL
-    )
-
-    email_html = re.sub(
-        r"<form.*?>.*?</form>",
-        "",
-        email_html,
-        flags=re.IGNORECASE | re.DOTALL
-    )
-
-    # Remove inline JavaScript events
-    email_html = re.sub(
-        r"\son\w+\s*=\s*(['\"]).*?\1",
-        "",
-        email_html,
-        flags=re.IGNORECASE | re.DOTALL
-    )
-
-    # Add basic styling
-    full_html = f"""
-    <!DOCTYPE html>
-
-    <html>
-
-    <head>
-
-        <meta charset="UTF-8">
-
-        <style>
-
-            body {{
-                font-family:
-                    Arial,
-                    Helvetica,
-                    sans-serif;
-
-                font-size: 16px;
-
-                line-height: 1.6;
-
-                padding: 25px;
-
-                margin: 0;
-
-                background: white;
-
-                color: #222;
-
-                word-wrap: break-word;
-
-                overflow-wrap: break-word;
-            }}
-
-            img {{
-                max-width: 100%;
-                height: auto;
-            }}
-
-            table {{
-                max-width: 100%;
-                border-collapse: collapse;
-            }}
-
-            a {{
-                word-break: break-word;
-            }}
-
-        </style>
-
-    </head>
-
-    <body>
-
-        {email_html}
-
-    </body>
-
-    </html>
-    """
-
-    return full_html
-
-
-def display_html_email(email_html):
-
-    if not email_html:
-        return False
-
-    full_html = prepare_email_html(email_html)
-
-    if not full_html:
-        return False
-
-    # NEW Streamlit API
-    st.iframe(
-        full_html,
-        height=1200
-    )
-
-    return True
-
-
-# =========================================================
-# GET EMAIL
-# =========================================================
-
-def get_full_email(gmail, message_id):
+        return None, None
 
     try:
 
-        message = gmail.users().messages().get(
-            userId="me",
-            id=message_id,
-            format="full"
-        ).execute()
+        with open(MODEL_FILE, "rb") as file:
 
-        return message
+            vectorizer, model = pickle.load(file)
+
+        return vectorizer, model
 
     except Exception as e:
 
-        st.error(f"Could not load email: {e}")
-
-        return None
-
-
-# =========================================================
-# SEND EMAIL
-# =========================================================
-
-def send_email(
-    gmail,
-    recipient,
-    subject,
-    message,
-    thread_id=None,
-    extra_headers=None
-):
-
-    try:
-
-        mime_message = MIMEText(
-            message,
-            "plain",
-            "utf-8"
+        st.error(
+            f"Could not load spam model: {e}"
         )
 
-        mime_message["to"] = recipient
-        mime_message["subject"] = subject
+        return None, None
 
-        if extra_headers:
-
-            for key, value in extra_headers.items():
-
-                mime_message[key] = value
-
-        raw_message = base64.urlsafe_b64encode(
-            mime_message.as_bytes()
-        ).decode()
-
-        body = {
-            "raw": raw_message
-        }
-
-        if thread_id:
-            body["threadId"] = thread_id
-
-        gmail.users().messages().send(
-            userId="me",
-            body=body
-        ).execute()
-
-        return True
-
-    except Exception as e:
-
-        st.error(f"Email sending failed: {e}")
-
-        return False
-
-
-# =========================================================
-# SPAM DETECTION
-# =========================================================
 
 def detect_spam(subject, sender, body):
 
-    if vectorizer is None or spam_model is None:
+    vectorizer, model = load_spam_model()
+
+    if vectorizer is None or model is None:
 
         return "unknown", 0.0
 
-    text = (
-        str(subject)
-        + " "
-        + str(sender)
-        + " "
-        + str(body)
-    )
+    text = f"{subject} {sender} {body}"
 
     try:
 
         transformed = vectorizer.transform([text])
 
-        prediction = spam_model.predict(
-            transformed
-        )[0]
+        prediction = model.predict(transformed)[0]
 
-        result = "spam" if prediction == 1 else "safe"
+        if hasattr(model, "predict_proba"):
 
-        confidence = 0.0
-
-        if hasattr(spam_model, "predict_proba"):
-
-            probabilities = spam_model.predict_proba(
+            probabilities = model.predict_proba(
                 transformed
             )[0]
 
             confidence = max(probabilities) * 100
 
-        return result, confidence
+        else:
+
+            confidence = 100.0
+
+        if int(prediction) == 1:
+
+            return "spam", confidence
+
+        return "safe", confidence
 
     except Exception:
 
         return "unknown", 0.0
 
 
-# =========================================================
-# AUTOMATIC SPAM CHECK
-# =========================================================
+# ============================================================
+# EMAIL SPAM CHECK
+# ============================================================
 
-def automatic_spam_check(gmail, message_id):
+def analyze_email(gmail, message_id):
 
-    if message_id in st.session_state.spam_results:
-
-        return st.session_state.spam_results[
-            message_id
-        ]
-
-    message = get_full_email(
+    message = get_message(
         gmail,
         message_id
     )
 
     if not message:
 
-        return "unknown", 0.0
-
-    payload = message.get(
-        "payload",
-        {}
-    )
-
-    headers = payload.get(
-        "headers",
-        []
-    )
+        return "unknown", 0
 
     subject = get_header(
-        headers,
+        message,
         "Subject"
     )
 
     sender = get_header(
-        headers,
+        message,
         "From"
     )
 
     body = get_email_body(
-        payload
+        message.get("payload", {})
     )
 
     result, confidence = detect_spam(
@@ -550,79 +463,100 @@ def automatic_spam_check(gmail, message_id):
     return result, confidence
 
 
-# =========================================================
-# SPAM RESULT
-# =========================================================
+# ============================================================
+# SEND EMAIL
+# ============================================================
 
-def show_full_width_spam_result(
-    result,
-    confidence,
-    title="AI Spam Analysis"
+def send_email(
+    gmail,
+    recipient,
+    subject,
+    message,
+    thread_id=None
 ):
-
-    st.markdown("---")
-
-    if result == "spam":
-
-        st.error(
-            f"🚨 **{title}: SPAM EMAIL**\n\n"
-            f"AI confidence: **{confidence:.1f}%**"
-        )
-
-    elif result == "safe":
-
-        st.success(
-            f"✅ **{title}: LOOKS SAFE**\n\n"
-            f"AI confidence: **{confidence:.1f}%**"
-        )
-
-    else:
-
-        st.warning(
-            f"⚠️ **{title}: Unable to analyze email**"
-        )
-
-    st.markdown("---")
-
-
-# =========================================================
-# STAR / UNSTAR
-# =========================================================
-
-def toggle_star(gmail, message_id, starred):
 
     try:
 
-        if starred:
+        email_message = MIMEText(
+            message,
+            "plain"
+        )
 
-            gmail.users().messages().modify(
-                userId="me",
-                id=message_id,
-                body={
-                    "removeLabelIds": ["STARRED"]
-                }
-            ).execute()
+        email_message["to"] = recipient
+        email_message["subject"] = subject
 
-        else:
+        raw = base64.urlsafe_b64encode(
+            email_message.as_bytes()
+        ).decode()
 
-            gmail.users().messages().modify(
-                userId="me",
-                id=message_id,
-                body={
-                    "addLabelIds": ["STARRED"]
-                }
-            ).execute()
+        body = {
+            "raw": raw
+        }
 
-        st.rerun()
+        if thread_id:
+            body["threadId"] = thread_id
+
+        gmail.users().messages().send(
+            userId="me",
+            body=body
+        ).execute()
+
+        return True
 
     except Exception as e:
 
-        st.error(f"Star action failed: {e}")
+        st.error(
+            f"Could not send email: {e}"
+        )
+
+        return False
 
 
-# =========================================================
-# TRASH EMAIL
-# =========================================================
+# ============================================================
+# STAR / TRASH
+# ============================================================
+
+def star_email(gmail, message_id):
+
+    try:
+
+        gmail.users().messages().modify(
+            userId="me",
+            id=message_id,
+            body={
+                "addLabelIds": ["STARRED"]
+            }
+        ).execute()
+
+        return True
+
+    except Exception as e:
+
+        st.error(str(e))
+
+        return False
+
+
+def unstar_email(gmail, message_id):
+
+    try:
+
+        gmail.users().messages().modify(
+            userId="me",
+            id=message_id,
+            body={
+                "removeLabelIds": ["STARRED"]
+            }
+        ).execute()
+
+        return True
+
+    except Exception as e:
+
+        st.error(str(e))
+
+        return False
+
 
 def trash_email(gmail, message_id):
 
@@ -633,55 +567,208 @@ def trash_email(gmail, message_id):
             id=message_id
         ).execute()
 
-        st.success("Email moved to Trash.")
-
-        st.rerun()
+        return True
 
     except Exception as e:
 
-        st.error(f"Could not move email to Trash: {e}")
+        st.error(str(e))
+
+        return False
 
 
-# =========================================================
-# GET EMAIL LIST
-# =========================================================
+# ============================================================
+# SPAM RESULT UI
+# ============================================================
 
-def get_messages(
-    gmail,
-    query="",
-    max_results=20
-):
+def show_spam_result(result, confidence):
 
-    try:
-
-        response = gmail.users().messages().list(
-            userId="me",
-            q=query,
-            maxResults=max_results
-        ).execute()
-
-        return response.get(
-            "messages",
-            []
-        )
-
-    except Exception as e:
+    if result == "spam":
 
         st.error(
-            f"Could not retrieve emails: {e}"
+            f"🚨 SPAM EMAIL\n\n"
+            f"AI Confidence: {confidence:.2f}%"
         )
 
-        return []
+    elif result == "safe":
+
+        st.success(
+            f"✅ SAFE EMAIL\n\n"
+            f"AI Confidence: {confidence:.2f}%"
+        )
 
 
-# =========================================================
-# EMAIL DISPLAY
-# =========================================================
+# ============================================================
+# EMAIL READER
+# ============================================================
+
+def show_email(gmail, message_id):
+
+    message = get_message(
+        gmail,
+        message_id
+    )
+
+    if not message:
+        return
+
+    subject = get_header(
+        message,
+        "Subject"
+    )
+
+    sender = get_header(
+        message,
+        "From"
+    )
+
+    recipient = get_header(
+        message,
+        "To"
+    )
+
+    date = get_header(
+        message,
+        "Date"
+    )
+
+    st.button(
+        "⬅️ Back to Inbox",
+        on_click=lambda: st.session_state.update(
+            {"selected_email": None}
+        )
+    )
+
+    st.markdown(
+        f"# {subject or '(No Subject)'}"
+    )
+
+    st.write(f"**From:** {sender}")
+    st.write(f"**To:** {recipient}")
+    st.write(f"**Date:** {date}")
+
+    st.divider()
+
+    # AI spam analysis
+    if st.button(
+        "🧠 Check Spam",
+        key=f"reader_spam_{message_id}"
+    ):
+
+        result, confidence = analyze_email(
+            gmail,
+            message_id
+        )
+
+        show_spam_result(
+            result,
+            confidence
+        )
+
+    if message_id in st.session_state.spam_results:
+
+        result, confidence = (
+            st.session_state.spam_results[
+                message_id
+            ]
+        )
+
+        show_spam_result(
+            result,
+            confidence
+        )
+
+    # Buttons
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+
+        if st.button(
+            "⭐ Star",
+            key=f"reader_star_{message_id}"
+        ):
+
+            star_email(
+                gmail,
+                message_id
+            )
+
+            st.rerun()
+
+    with col2:
+
+        if st.button(
+            "🗑️ Trash",
+            key=f"reader_trash_{message_id}"
+        ):
+
+            trash_email(
+                gmail,
+                message_id
+            )
+
+            st.session_state.selected_email = None
+
+            st.rerun()
+
+    with col3:
+
+        if st.button(
+            "↩️ Reply",
+            key=f"reader_reply_{message_id}"
+        ):
+
+            st.session_state.reply_email = message_id
+
+    st.divider()
+
+    # Display HTML email
+    html_body = get_html_body(
+        message.get("payload", {})
+    )
+
+    if html_body:
+
+        safe_html = re.sub(
+            r"<script.*?>.*?</script>",
+            "",
+            html_body,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+
+        safe_html = re.sub(
+            r"<iframe.*?>.*?</iframe>",
+            "",
+            safe_html,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+
+        st.components.v1.html(
+            safe_html,
+            height=700,
+            scrolling=True
+        )
+
+    else:
+
+        body = get_email_body(
+            message.get("payload", {})
+        )
+
+        st.text_area(
+            "Email Content",
+            body,
+            height=500
+        )
+
+
+# ============================================================
+# EMAIL LIST
+# ============================================================
 
 def display_emails(
     gmail,
     messages,
-    folder_name
+    folder_name="Inbox"
 ):
 
     if not messages:
@@ -692,11 +779,11 @@ def display_emails(
 
         return
 
-    for msg in messages:
+    for item in messages:
 
-        message_id = msg["id"]
+        message_id = item["id"]
 
-        message = get_full_email(
+        message = get_message(
             gmail,
             message_id
         )
@@ -704,628 +791,526 @@ def display_emails(
         if not message:
             continue
 
-        payload = message.get(
-            "payload",
-            {}
-        )
-
-        headers = payload.get(
-            "headers",
-            []
-        )
-
         subject = get_header(
-            headers,
+            message,
             "Subject"
         )
 
         sender = get_header(
-            headers,
+            message,
             "From"
         )
 
-        recipient = get_header(
-            headers,
-            "To"
-        )
-
         date = get_header(
-            headers,
+            message,
             "Date"
         )
 
-        snippet = message.get(
-            "snippet",
-            ""
-        )
-
-        label_ids = message.get(
+        labels = message.get(
             "labelIds",
             []
         )
 
-        starred = "STARRED" in label_ids
+        st.markdown(
+            '<div class="email-card">',
+            unsafe_allow_html=True
+        )
 
-        if not subject:
-            subject = "(No Subject)"
+        st.markdown(
+            f"### 📧 {subject or '(No Subject)'}"
+        )
 
-        # =================================================
-        # EMAIL CARD
-        # =================================================
+        st.write(
+            f"**From:** {sender}"
+        )
 
-        with st.expander(
-            f"📧 {subject}"
-        ):
+        st.caption(date)
 
-            st.write(
-                f"**From:** {sender}"
-            )
+        # Automatic spam detection in inbox
+        if folder_name == "Inbox":
 
-            st.write(
-                f"**To:** {recipient}"
-            )
+            if message_id not in st.session_state.spam_results:
 
-            st.write(
-                f"**Date:** {date}"
-            )
-
-            if snippet:
-
-                st.caption(
-                    snippet
-                )
-
-            # Automatic spam check for Inbox
-            if folder_name == "Inbox":
-
-                result, confidence = automatic_spam_check(
+                result, confidence = analyze_email(
                     gmail,
                     message_id
                 )
 
-                show_full_width_spam_result(
-                    result,
-                    confidence,
-                    "SmartMail AI"
-                )
-
-            # =============================================
-            # BUTTONS
-            # =============================================
-
-            col1, col2, col3, col4, col5, col6 = st.columns(6)
-
-            with col1:
-
-                if st.button(
-                    "📖 Read",
-                    key=f"read_{message_id}"
-                ):
-
-                    st.session_state.selected_email = (
-                        message_id
-                    )
-
-                    st.rerun()
-
-            with col2:
-
-                if st.button(
-                    "↩️ Reply",
-                    key=f"reply_{message_id}"
-                ):
-
-                    st.session_state.reply_to = (
-                        message_id
-                    )
-
-                    st.rerun()
-
-            with col3:
-
-                if st.button(
-                    "↪️ Forward",
-                    key=f"forward_{message_id}"
-                ):
-
-                    st.session_state.forward_email = (
-                        message_id
-                    )
-
-                    st.rerun()
-
-            with col4:
-
-                star_text = (
-                    "☆ Star"
-                    if not starred
-                    else
-                    "⭐ Unstar"
-                )
-
-                if st.button(
-                    star_text,
-                    key=f"star_{message_id}"
-                ):
-
-                    toggle_star(
-                        gmail,
-                        message_id,
-                        starred
-                    )
-
-            with col5:
-
-                if st.button(
-                    "🧠 Check Spam",
-                    key=f"check_{message_id}"
-                ):
-
-                    result, confidence = automatic_spam_check(
-                        gmail,
-                        message_id
-                    )
-
-                    st.session_state.manual_spam_results[
-                        message_id
-                    ] = (
-                        result,
-                        confidence
-                    )
-
-                    st.rerun()
-
-            with col6:
-
-                if st.button(
-                    "🗑️ Trash",
-                    key=f"trash_{message_id}"
-                ):
-
-                    trash_email(
-                        gmail,
-                        message_id
-                    )
-
-            # =============================================
-            # MANUAL SPAM RESULT
-            # =============================================
-
-            if message_id in st.session_state.manual_spam_results:
+            else:
 
                 result, confidence = (
-                    st.session_state.manual_spam_results[
+                    st.session_state.spam_results[
                         message_id
                     ]
                 )
 
-                show_full_width_spam_result(
-                    result,
-                    confidence,
-                    "Manual Spam Check"
+            if result == "spam":
+
+                st.warning(
+                    f"🚨 AI detected this email as SPAM "
+                    f"({confidence:.1f}% confidence)"
                 )
 
+            elif result == "safe":
 
-# =========================================================
-# FULL EMAIL READER
-# =========================================================
+                st.success(
+                    f"✅ AI: Safe email "
+                    f"({confidence:.1f}% confidence)"
+                )
 
-def show_full_email(gmail, message_id):
+        col1, col2, col3, col4, col5 = st.columns(5)
 
-    message = get_full_email(
-        gmail,
-        message_id
-    )
+        with col1:
 
-    if not message:
+            if st.button(
+                "📖 Read",
+                key=f"read_{message_id}"
+            ):
 
-        return
+                st.session_state.selected_email = (
+                    message_id
+                )
 
-    payload = message.get(
-        "payload",
-        {}
-    )
+                st.rerun()
 
-    headers = payload.get(
-        "headers",
-        []
-    )
+        with col2:
 
-    subject = get_header(
-        headers,
-        "Subject"
-    )
+            if "STARRED" in labels:
 
-    sender = get_header(
-        headers,
-        "From"
-    )
+                if st.button(
+                    "☆ Unstar",
+                    key=f"unstar_{message_id}"
+                ):
 
-    recipient = get_header(
-        headers,
-        "To"
-    )
+                    unstar_email(
+                        gmail,
+                        message_id
+                    )
 
-    date = get_header(
-        headers,
-        "Date"
-    )
+                    st.rerun()
 
-    thread_id = message.get(
-        "threadId"
-    )
+            else:
 
-    st.button(
-        "⬅️ Back to Inbox",
-        key="back_from_email",
-        on_click=lambda: (
-            st.session_state.update(
-                selected_email=None
-            )
-        )
-    )
+                if st.button(
+                    "⭐ Star",
+                    key=f"star_{message_id}"
+                ):
 
-    st.title(
-        f"📧 {subject or '(No Subject)'}"
-    )
+                    star_email(
+                        gmail,
+                        message_id
+                    )
 
-    st.write(
-        f"**From:** {sender}"
-    )
+                    st.rerun()
 
-    st.write(
-        f"**To:** {recipient}"
-    )
+        with col3:
 
-    st.write(
-        f"**Date:** {date}"
-    )
+            if st.button(
+                "🧠 Check",
+                key=f"check_{message_id}"
+            ):
 
-    # =============================================
-    # SPAM ANALYSIS
-    # =============================================
+                result, confidence = analyze_email(
+                    gmail,
+                    message_id
+                )
 
-    result, confidence = automatic_spam_check(
-        gmail,
-        message_id
-    )
+                show_spam_result(
+                    result,
+                    confidence
+                )
 
-    show_full_width_spam_result(
-        result,
-        confidence,
-        "SmartMail AI"
-    )
+        with col4:
 
-    # =============================================
-    # ACTION BUTTONS
-    # =============================================
+            if st.button(
+                "🗑️ Trash",
+                key=f"trash_{message_id}"
+            ):
 
-    col1, col2, col3, col4 = st.columns(4)
+                trash_email(
+                    gmail,
+                    message_id
+                )
 
-    label_ids = message.get(
-        "labelIds",
-        []
-    )
+                st.rerun()
 
-    starred = "STARRED" in label_ids
+        with col5:
 
-    with col1:
+            if st.button(
+                "↩️ Reply",
+                key=f"reply_{message_id}"
+            ):
 
-        if st.button(
-            "↩️ Reply",
-            key="full_reply"
-        ):
-
-            st.session_state.reply_to = (
-                message_id
-            )
-
-            st.rerun()
-
-    with col2:
-
-        if st.button(
-            "↪️ Forward",
-            key="full_forward"
-        ):
-
-            st.session_state.forward_email = (
-                message_id
-            )
-
-            st.rerun()
-
-    with col3:
-
-        if st.button(
-            "⭐ Star" if not starred else "☆ Unstar",
-            key="full_star"
-        ):
-
-            toggle_star(
-                gmail,
-                message_id,
-                starred
-            )
-
-    with col4:
-
-        if st.button(
-            "🗑️ Trash",
-            key="full_trash"
-        ):
-
-            trash_email(
-                gmail,
-                message_id
-            )
-
-    st.divider()
-
-    # =============================================
-    # EMAIL BODY
-    # =============================================
-
-    email_html = get_email_html(
-        payload
-    )
-
-    if email_html:
-
-        display_html_email(
-            email_html
-        )
-
-    else:
-
-        plain_text = get_email_body(
-            payload
-        )
+                st.session_state.reply_email = (
+                    message_id
+                )
 
         st.markdown(
-            f"""
-            <div style="
-                padding:25px;
-                border:1px solid #ddd;
-                border-radius:10px;
-                white-space:pre-wrap;
-                font-size:16px;
-            ">
-            {html.escape(plain_text)}
-            </div>
-            """,
+            "</div>",
             unsafe_allow_html=True
         )
 
 
-# =========================================================
-# REPLY EMAIL
-# =========================================================
+# ============================================================
+# SIDEBAR
+# ============================================================
 
-def show_reply_form(gmail, message_id):
+with st.sidebar:
 
-    message = get_full_email(
+    st.markdown(
+        "# 📧 SmartMail"
+    )
+
+    st.caption(
+        "AI-Powered Gmail Assistant"
+    )
+
+    st.divider()
+
+    pages = [
+        "📊 Dashboard",
+        "📧 Inbox",
+        "⭐ Starred",
+        "📤 Sent",
+        "🚫 Spam",
+        "🗑️ Trash",
+        "✉️ Compose Email",
+        "🧠 Spam Detector",
+        "🤖 AI Customer Care"
+    ]
+
+    for page in pages:
+
+        if st.button(
+            page,
+            use_container_width=True
+        ):
+
+            st.session_state.page = page
+            st.session_state.selected_email = None
+            st.rerun()
+
+# ============================================================
+# GMAIL INITIALIZATION
+# ============================================================
+
+if st.session_state.gmail is None:
+
+    st.session_state.gmail = get_gmail_service()
+
+gmail = st.session_state.gmail
+
+# ============================================================
+# HEADER
+# ============================================================
+
+st.markdown(
+    '<div class="smartmail-title">📊 SmartMail AI Dashboard</div>',
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="smartmail-subtitle">'
+    'Welcome to your AI-powered Gmail assistant.'
+    '</div>',
+    unsafe_allow_html=True
+)
+
+st.divider()
+
+# ============================================================
+# CONNECTION CHECK
+# ============================================================
+
+if gmail is None:
+
+    st.error(
+        "Gmail is not connected."
+    )
+
+    st.stop()
+
+# ============================================================
+# SELECTED EMAIL
+# ============================================================
+
+if st.session_state.selected_email:
+
+    show_email(
         gmail,
-        message_id
+        st.session_state.selected_email
     )
 
-    if not message:
-        return
+    st.stop()
 
-    payload = message.get(
-        "payload",
-        {}
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+if st.session_state.page == "📊 Dashboard":
+
+    st.subheader("📊 Dashboard")
+
+    inbox = get_messages(
+        gmail,
+        "in:inbox",
+        100
     )
 
-    headers = payload.get(
-        "headers",
-        []
+    starred = get_messages(
+        gmail,
+        "is:starred",
+        100
     )
 
-    sender = get_header(
-        headers,
-        "From"
+    sent = get_messages(
+        gmail,
+        "in:sent",
+        100
     )
 
-    subject = get_header(
-        headers,
-        "Subject"
+    spam = get_messages(
+        gmail,
+        "in:spam",
+        100
     )
 
-    message_id_header = get_header(
-        headers,
-        "Message-ID"
+    trash = get_messages(
+        gmail,
+        "in:trash",
+        100
     )
 
-    references = get_header(
-        headers,
-        "References"
-    )
+    c1, c2, c3, c4, c5 = st.columns(5)
 
-    if not subject.lower().startswith("re:"):
+    with c1:
+        st.metric(
+            "📧 Inbox",
+            len(inbox)
+        )
 
-        subject = "Re: " + subject
+    with c2:
+        st.metric(
+            "⭐ Starred",
+            len(starred)
+        )
+
+    with c3:
+        st.metric(
+            "📤 Sent",
+            len(sent)
+        )
+
+    with c4:
+        st.metric(
+            "🚫 Spam",
+            len(spam)
+        )
+
+    with c5:
+        st.metric(
+            "🗑️ Trash",
+            len(trash)
+        )
+
+    st.divider()
 
     st.subheader(
-        "↩️ Reply to Email"
-    )
-
-    st.write(
-        f"**To:** {sender}"
-    )
-
-    reply_text = st.text_area(
-        "Message",
-        height=250,
-        key=f"reply_text_{message_id}"
+        "🧠 AI Spam Analysis"
     )
 
     if st.button(
-        "📤 Send Reply",
-        key=f"send_reply_{message_id}"
+        "🔍 Analyze Latest Inbox"
     ):
 
-        extra_headers = {
-            "In-Reply-To": message_id_header
-        }
+        spam_count = 0
+        safe_count = 0
 
-        if references:
+        for item in inbox[:20]:
 
-            extra_headers["References"] = (
-                references
-                + " "
-                + message_id_header
-            )
+            message_id = item["id"]
 
-        else:
-
-            extra_headers["References"] = (
-                message_id_header
-            )
-
-        if reply_text.strip():
-
-            success = send_email(
+            result, confidence = analyze_email(
                 gmail,
-                sender,
-                subject,
-                reply_text,
-                thread_id=message.get("threadId"),
-                extra_headers=extra_headers
+                message_id
             )
 
-            if success:
+            if result == "spam":
+                spam_count += 1
 
-                st.success(
-                    "Reply sent successfully! ✅"
+            elif result == "safe":
+                safe_count += 1
+
+        total = spam_count + safe_count
+
+        if total:
+
+            percentage = (
+                spam_count / total
+            ) * 100
+
+            a, b, c = st.columns(3)
+
+            with a:
+                st.metric(
+                    "🚨 Spam",
+                    spam_count
                 )
 
-                st.session_state.reply_to = None
+            with b:
+                st.metric(
+                    "✅ Safe",
+                    safe_count
+                )
 
-                st.rerun()
+            with c:
+                st.metric(
+                    "Spam %",
+                    f"{percentage:.1f}%"
+                )
 
+            chart = pd.DataFrame(
+                {
+                    "Category": [
+                        "Spam",
+                        "Safe"
+                    ],
+                    "Emails": [
+                        spam_count,
+                        safe_count
+                    ]
+                }
+            )
 
-# =========================================================
-# FORWARD EMAIL
-# =========================================================
+            st.bar_chart(
+                chart.set_index("Category")
+            )
 
-def show_forward_form(gmail, message_id):
+# ============================================================
+# INBOX
+# ============================================================
 
-    message = get_full_email(
+elif st.session_state.page == "📧 Inbox":
+
+    st.subheader("📧 Inbox")
+
+    search = st.text_input(
+        "🔎 Search emails",
+        placeholder="Search Gmail..."
+    )
+
+    if st.button("🔄 Refresh Inbox"):
+
+        st.session_state.email_cache = {}
+        st.session_state.spam_results = {}
+
+        st.rerun()
+
+    query = "in:inbox"
+
+    if search.strip():
+
+        query += f" {search}"
+
+    messages = get_messages(
         gmail,
-        message_id
+        query,
+        20
     )
 
-    if not message:
-        return
-
-    payload = message.get(
-        "payload",
-        {}
+    display_emails(
+        gmail,
+        messages,
+        "Inbox"
     )
 
-    headers = payload.get(
-        "headers",
-        []
+# ============================================================
+# STARRED
+# ============================================================
+
+elif st.session_state.page == "⭐ Starred":
+
+    st.subheader("⭐ Starred Emails")
+
+    messages = get_messages(
+        gmail,
+        "is:starred",
+        20
     )
 
-    subject = get_header(
-        headers,
-        "Subject"
+    display_emails(
+        gmail,
+        messages,
+        "Starred"
     )
 
-    sender = get_header(
-        headers,
-        "From"
+# ============================================================
+# SENT
+# ============================================================
+
+elif st.session_state.page == "📤 Sent":
+
+    st.subheader("📤 Sent Emails")
+
+    messages = get_messages(
+        gmail,
+        "in:sent",
+        20
     )
 
-    date = get_header(
-        headers,
-        "Date"
+    display_emails(
+        gmail,
+        messages,
+        "Sent"
     )
 
-    body = get_email_body(
-        payload
+# ============================================================
+# SPAM
+# ============================================================
+
+elif st.session_state.page == "🚫 Spam":
+
+    st.subheader("🚫 Gmail Spam")
+
+    messages = get_messages(
+        gmail,
+        "in:spam",
+        20
     )
 
-    if not subject.lower().startswith("fwd:"):
-
-        subject = "Fwd: " + subject
-
-    st.subheader(
-        "↪️ Forward Email"
+    display_emails(
+        gmail,
+        messages,
+        "Spam"
     )
 
-    recipient = st.text_input(
-        "Forward to",
-        key=f"forward_recipient_{message_id}"
+# ============================================================
+# TRASH
+# ============================================================
+
+elif st.session_state.page == "🗑️ Trash":
+
+    st.subheader("🗑️ Trash")
+
+    messages = get_messages(
+        gmail,
+        "in:trash",
+        20
     )
 
-    message_text = st.text_area(
-        "Message",
-        height=200,
-        key=f"forward_message_{message_id}"
+    display_emails(
+        gmail,
+        messages,
+        "Trash"
     )
 
-    forwarded_content = f"""
+# ============================================================
+# COMPOSE
+# ============================================================
 
----------- Forwarded message ----------
+elif st.session_state.page == "✉️ Compose Email":
 
-From: {sender}
-Date: {date}
-Subject: {subject}
-
-{body}
-
-----------------------------------------
-"""
-
-    if st.button(
-        "📤 Forward Email",
-        key=f"send_forward_{message_id}"
-    ):
-
-        if not recipient.strip():
-
-            st.warning(
-                "Please enter recipient email."
-            )
-
-        else:
-
-            final_message = (
-                message_text
-                + "\n"
-                + forwarded_content
-            )
-
-            success = send_email(
-                gmail,
-                recipient,
-                subject,
-                final_message
-            )
-
-            if success:
-
-                st.success(
-                    "Email forwarded successfully! ✅"
-                )
-
-                st.session_state.forward_email = None
-
-                st.rerun()
-
-
-# =========================================================
-# COMPOSE EMAIL
-# =========================================================
-
-def compose_email(gmail):
-
-    st.title(
-        "✉️ Compose Email"
-    )
+    st.subheader("✉️ Compose Email")
 
     recipient = st.text_input(
         "To"
@@ -1337,24 +1322,17 @@ def compose_email(gmail):
 
     message = st.text_area(
         "Message",
-        height=300
+        height=250
     )
 
     if st.button(
-        "📤 Send Email",
-        type="primary"
+        "📤 Send Email"
     ):
 
         if not recipient:
 
             st.warning(
                 "Please enter recipient email."
-            )
-
-        elif not message:
-
-            st.warning(
-                "Please enter message."
             )
 
         else:
@@ -1369,182 +1347,17 @@ def compose_email(gmail):
             if success:
 
                 st.success(
-                    "Email sent successfully! 🎉"
+                    "✅ Email sent successfully!"
                 )
 
+# ============================================================
+# SPAM DETECTOR
+# ============================================================
 
-# =========================================================
-# DASHBOARD
-# =========================================================
-
-def dashboard(gmail):
-
-    st.title(
-        "📊 SmartMail AI Dashboard"
-    )
-
-    st.write(
-        "Welcome to your AI-powered Gmail assistant."
-    )
-
-    inbox = get_messages(
-        gmail,
-        "in:inbox",
-        20
-    )
-
-    sent = get_messages(
-        gmail,
-        "in:sent",
-        20
-    )
-
-    starred = get_messages(
-        gmail,
-        "is:starred",
-        20
-    )
-
-    spam = get_messages(
-        gmail,
-        "in:spam",
-        20
-    )
-
-    trash = get_messages(
-        gmail,
-        "in:trash",
-        20
-    )
-
-    col1, col2, col3, col4, col5 = st.columns(5)
-
-    with col1:
-
-        st.metric(
-            "📥 Inbox",
-            len(inbox)
-        )
-
-    with col2:
-
-        st.metric(
-            "📤 Sent",
-            len(sent)
-        )
-
-    with col3:
-
-        st.metric(
-            "⭐ Starred",
-            len(starred)
-        )
-
-    with col4:
-
-        st.metric(
-            "🚫 Spam",
-            len(spam)
-        )
-
-    with col5:
-
-        st.metric(
-            "🗑️ Trash",
-            len(trash)
-        )
-
-    st.divider()
+elif st.session_state.page == "🧠 Spam Detector":
 
     st.subheader(
-        "🧠 SmartMail AI Analysis"
-    )
-
-    if st.button(
-        "🧠 Analyze Latest Inbox"
-    ):
-
-        spam_count = 0
-        safe_count = 0
-
-        progress = st.progress(0)
-
-        total = min(
-            len(inbox),
-            20
-        )
-
-        for index, msg in enumerate(inbox[:20]):
-
-            result, confidence = automatic_spam_check(
-                gmail,
-                msg["id"]
-            )
-
-            if result == "spam":
-
-                spam_count += 1
-
-            elif result == "safe":
-
-                safe_count += 1
-
-            if total > 0:
-
-                progress.progress(
-                    (index + 1) / total
-                )
-
-        progress.empty()
-
-        total_analyzed = (
-            spam_count
-            + safe_count
-        )
-
-        if total_analyzed:
-
-            spam_percentage = (
-                spam_count
-                / total_analyzed
-                * 100
-            )
-
-            st.metric(
-                "🚨 Spam Percentage",
-                f"{spam_percentage:.1f}%"
-            )
-
-            chart_data = pd.DataFrame(
-                {
-                    "Type": [
-                        "Spam",
-                        "Safe"
-                    ],
-                    "Emails": [
-                        spam_count,
-                        safe_count
-                    ]
-                }
-            )
-
-            st.bar_chart(
-                chart_data.set_index("Type")
-            )
-
-
-# =========================================================
-# SPAM DETECTOR PAGE
-# =========================================================
-
-def spam_detector():
-
-    st.title(
-        "🧠 SmartMail Spam Detector"
-    )
-
-    st.write(
-        "Paste an email below and let the ML model check it."
+        "🧠 AI Spam Email Detector"
     )
 
     subject = st.text_input(
@@ -1557,12 +1370,11 @@ def spam_detector():
 
     body = st.text_area(
         "Email Content",
-        height=300
+        height=250
     )
 
     if st.button(
-        "🔍 Detect Spam",
-        type="primary"
+        "🔍 Detect Spam"
     ):
 
         if not body.strip():
@@ -1579,460 +1391,87 @@ def spam_detector():
                 body
             )
 
-            show_full_width_spam_result(
+            show_spam_result(
                 result,
-                confidence,
-                "Spam Detector"
+                confidence
             )
 
-
-# =========================================================
+# ============================================================
 # AI CUSTOMER CARE
-# =========================================================
+# ============================================================
 
-def ai_customer_care():
+elif st.session_state.page == "🤖 AI Customer Care":
 
-    st.title(
+    st.subheader(
         "🤖 SmartMail AI Customer Care"
     )
 
     st.write(
-        "Ask me anything about SmartMail."
+        "Ask questions about SmartMail, spam detection, "
+        "Gmail features, or email security."
     )
 
-    if "chat_messages" not in st.session_state:
-
-        st.session_state.chat_messages = []
-
-    for message in st.session_state.chat_messages:
-
-        with st.chat_message(
-            message["role"]
-        ):
-
-            st.write(
-                message["content"]
-            )
-
-    user_message = st.chat_input(
-        "Type your question..."
+    prompt = st.text_area(
+        "💬 Ask SmartMail AI",
+        height=150,
+        placeholder="Type your question..."
     )
 
-    if user_message:
+    if st.button(
+        "🤖 Ask AI"
+    ):
 
-        st.session_state.chat_messages.append(
-            {
-                "role": "user",
-                "content": user_message
-            }
-        )
+        if not prompt.strip():
 
-        with st.chat_message("user"):
-
-            st.write(
-                user_message
+            st.warning(
+                "Please enter a question."
             )
 
-        try:
+        else:
 
-            response = ollama.chat(
-                model="llama3.2:3b",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": """
-You are SmartMail AI Customer Care.
+            try:
 
-Help users with:
-- Gmail
-- SmartMail
-- Spam detection
-- Sending emails
-- Reading emails
-- Starred emails
-- Trash
-- AI features
-- Basic troubleshooting
+                import ollama
 
-Give simple beginner-friendly answers.
-"""
-                    },
-                    *st.session_state.chat_messages
-                ]
-            )
-
-            assistant_message = (
-                response["message"]["content"]
-            )
-
-            st.session_state.chat_messages.append(
-                {
-                    "role": "assistant",
-                    "content": assistant_message
-                }
-            )
-
-            with st.chat_message(
-                "assistant"
-            ):
-
-                st.write(
-                    assistant_message
+                response = ollama.chat(
+                    model="llama3.2:3b",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are SmartMail AI Customer Care. "
+                                "Answer clearly and simply. "
+                                "Help users understand Gmail, "
+                                "SmartMail and spam detection."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ]
                 )
 
-        except Exception as e:
+                st.success(
+                    "🤖 SmartMail AI"
+                )
 
-            st.error(
-                "Ollama could not respond.\n\n"
-                f"Error: {e}"
-            )
+                st.write(
+                    response["message"]["content"]
+                )
 
+            except Exception as e:
 
-# =========================================================
-# SIDEBAR
-# =========================================================
+                st.error(
+                    f"AI error: {e}"
+                )
 
-with st.sidebar:
-
-    st.title(
-        "📧 SmartMail AI"
-    )
-
-    st.caption(
-        "AI-Powered Gmail Assistant"
-    )
-
-    st.divider()
-
-    if st.button(
-        "📊 Dashboard",
-        use_container_width=True
-    ):
-
-        st.session_state.page = "📊 Dashboard"
-        st.session_state.selected_email = None
-        st.rerun()
-
-    if st.button(
-        "📧 Inbox",
-        use_container_width=True
-    ):
-
-        st.session_state.page = "📧 Inbox"
-        st.session_state.selected_email = None
-        st.rerun()
-
-    if st.button(
-        "⭐ Starred",
-        use_container_width=True
-    ):
-
-        st.session_state.page = "⭐ Starred"
-        st.session_state.selected_email = None
-        st.rerun()
-
-    if st.button(
-        "📤 Sent",
-        use_container_width=True
-    ):
-
-        st.session_state.page = "📤 Sent"
-        st.session_state.selected_email = None
-        st.rerun()
-
-    if st.button(
-        "🚫 Spam",
-        use_container_width=True
-    ):
-
-        st.session_state.page = "🚫 Spam"
-        st.session_state.selected_email = None
-        st.rerun()
-
-    if st.button(
-        "🗑️ Trash",
-        use_container_width=True
-    ):
-
-        st.session_state.page = "🗑️ Trash"
-        st.session_state.selected_email = None
-        st.rerun()
-
-    st.divider()
-
-    if st.button(
-        "✉️ Compose Email",
-        use_container_width=True
-    ):
-
-        st.session_state.page = "✉️ Compose Email"
-        st.session_state.selected_email = None
-        st.rerun()
-
-    if st.button(
-        "🧠 Spam Detector",
-        use_container_width=True
-    ):
-
-        st.session_state.page = "🧠 Spam Detector"
-        st.session_state.selected_email = None
-        st.rerun()
-
-    if st.button(
-        "🤖 AI Customer Care",
-        use_container_width=True
-    ):
-
-        st.session_state.page = "🤖 AI Customer Care"
-        st.session_state.selected_email = None
-        st.rerun()
-
-    st.divider()
-
-    st.caption(
-        "SmartMail AI • Gmail + Machine Learning + Ollama"
-    )
-
-
-# =========================================================
-# CONNECT TO GMAIL
-# =========================================================
-
-gmail = get_gmail_service()
-
-if gmail is None:
-
-    st.stop()
-
-
-# =========================================================
-# FULL EMAIL READER
-# =========================================================
-
-if st.session_state.selected_email:
-
-    show_full_email(
-        gmail,
-        st.session_state.selected_email
-    )
-
-    # Reply
-    if st.session_state.get("reply_to"):
-
-        st.divider()
-
-        show_reply_form(
-            gmail,
-            st.session_state.reply_to
-        )
-
-    # Forward
-    if st.session_state.get("forward_email"):
-
-        st.divider()
-
-        show_forward_form(
-            gmail,
-            st.session_state.forward_email
-        )
-
-
-# =========================================================
-# NORMAL PAGES
-# =========================================================
-
-else:
-
-    current_page = st.session_state.page
-
-    # -----------------------------------------------------
-    # DASHBOARD
-    # -----------------------------------------------------
-
-    if current_page == "📊 Dashboard":
-
-        dashboard(gmail)
-
-    # -----------------------------------------------------
-    # INBOX
-    # -----------------------------------------------------
-
-    elif current_page == "📧 Inbox":
-
-        st.title(
-            "📧 Inbox"
-        )
-
-        search = st.text_input(
-            "🔍 Search emails",
-            placeholder="Search Gmail..."
-        )
-
-        col1, col2 = st.columns([6, 1])
-
-        with col2:
-
-            if st.button(
-                "🔄 Refresh"
-            ):
-
-                st.session_state.spam_results = {}
-                st.session_state.manual_spam_results = {}
-
-                st.rerun()
-
-        query = "in:inbox"
-
-        if search.strip():
-
-            query += f" {search}"
-
-        messages = get_messages(
-            gmail,
-            query,
-            20
-        )
-
-        display_emails(
-            gmail,
-            messages,
-            "Inbox"
-        )
-
-    # -----------------------------------------------------
-    # STARRED
-    # -----------------------------------------------------
-
-    elif current_page == "⭐ Starred":
-
-        st.title(
-            "⭐ Starred Emails"
-        )
-
-        messages = get_messages(
-            gmail,
-            "is:starred",
-            20
-        )
-
-        display_emails(
-            gmail,
-            messages,
-            "Starred"
-        )
-
-    # -----------------------------------------------------
-    # SENT
-    # -----------------------------------------------------
-
-    elif current_page == "📤 Sent":
-
-        st.title(
-            "📤 Sent Emails"
-        )
-
-        messages = get_messages(
-            gmail,
-            "in:sent",
-            20
-        )
-
-        display_emails(
-            gmail,
-            messages,
-            "Sent"
-        )
-
-    # -----------------------------------------------------
-    # SPAM
-    # -----------------------------------------------------
-
-    elif current_page == "🚫 Spam":
-
-        st.title(
-            "🚫 Gmail Spam"
-        )
-
-        messages = get_messages(
-            gmail,
-            "in:spam",
-            20
-        )
-
-        display_emails(
-            gmail,
-            messages,
-            "Spam"
-        )
-
-    # -----------------------------------------------------
-    # TRASH
-    # -----------------------------------------------------
-
-    elif current_page == "🗑️ Trash":
-
-        st.title(
-            "🗑️ Trash"
-        )
-
-        messages = get_messages(
-            gmail,
-            "in:trash",
-            20
-        )
-
-        display_emails(
-            gmail,
-            messages,
-            "Trash"
-        )
-
-    # -----------------------------------------------------
-    # COMPOSE
-    # -----------------------------------------------------
-
-    elif current_page == "✉️ Compose Email":
-
-        compose_email(
-            gmail
-        )
-
-    # -----------------------------------------------------
-    # SPAM DETECTOR
-    # -----------------------------------------------------
-
-    elif current_page == "🧠 Spam Detector":
-
-        spam_detector()
-
-    # -----------------------------------------------------
-    # AI CUSTOMER CARE
-    # -----------------------------------------------------
-
-    elif current_page == "🤖 AI Customer Care":
-
-        ai_customer_care()
-
-
-# =========================================================
+# ============================================================
 # FOOTER
-# =========================================================
+# ============================================================
 
-st.markdown(
-    """
-    <br><br>
-    <hr>
+st.divider()
 
-    <center>
-
-    <small>
-    📧 SmartMail AI |
-    Gmail Integration |
-    Machine Learning |
-    Ollama AI
-    </small>
-
-    </center>
-    """,
-    unsafe_allow_html=True
+st.caption(
+    "📧 SmartMail AI • Gmail + Machine Learning + Ollama"
 )
